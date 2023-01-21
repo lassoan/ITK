@@ -1041,7 +1041,8 @@ NiftiImageIO ::ReadImageInformation()
   // Check the intent code, it is a vector image, or matrix image, then this is
   // not true.
   //
-  if (this->m_NiftiImage->intent_code == NIFTI_INTENT_VECTOR ||
+  if (this->m_NiftiImage->intent_code == NIFTI_INTENT_DISPVECT ||
+      this->m_NiftiImage->intent_code == NIFTI_INTENT_VECTOR ||
       this->m_NiftiImage->intent_code == NIFTI_INTENT_SYMMATRIX)
   {
     if (this->m_NiftiImage->dim[4] > 1)
@@ -1083,7 +1084,8 @@ NiftiImageIO ::ReadImageInformation()
     this->SetNumberOfComponents(1);
   }
 
-  if (this->m_NiftiImage->intent_code == NIFTI_INTENT_VECTOR ||
+  if (this->m_NiftiImage->intent_code == NIFTI_INTENT_DISPVECT ||
+      this->m_NiftiImage->intent_code == NIFTI_INTENT_VECTOR ||
       this->m_NiftiImage->intent_code == NIFTI_INTENT_SYMMATRIX)
   {
     this->SetNumberOfComponents(this->m_NiftiImage->dim[5]);
@@ -1190,6 +1192,7 @@ NiftiImageIO ::ReadImageInformation()
     case NIFTI_INTENT_SYMMATRIX:
       this->SetPixelType(IOPixelEnum::SYMMETRICSECONDRANKTENSOR);
       break;
+    case NIFTI_INTENT_DISPVECT:
     case NIFTI_INTENT_VECTOR:
       this->SetPixelType(IOPixelEnum::VECTOR);
       break;
@@ -1221,7 +1224,6 @@ NiftiImageIO ::ReadImageInformation()
     case NIFTI_INTENT_LABEL:
     case NIFTI_INTENT_NEURONAME:
     case NIFTI_INTENT_GENMATRIX:
-    case NIFTI_INTENT_DISPVECT:
     case NIFTI_INTENT_POINTSET:
     case NIFTI_INTENT_TRIANGLE:
     case NIFTI_INTENT_QUATERNION:
@@ -1356,6 +1358,9 @@ NiftiImageIO ::ReadImageInformation()
 
   // set the image orientation
   this->SetImageIOOrientationFromNIfTI(dims);
+
+  // TODO: consider reorienting vector field values (NIFTI_INTENT_DISPVECT or NIFTI_INTENT_VECTOR)
+  // from NIFTI's native RAS to ITK's LPS coordinate system.
 
   // Set the metadata.
   this->SetImageIOMetadataFromNIfTI();
@@ -1523,9 +1528,9 @@ NiftiImageIO ::WriteImageInformation()
       !(this->GetPixelType() == IOPixelEnum::RGB && numComponents == 3) &&
       !(this->GetPixelType() == IOPixelEnum::RGBA && numComponents == 4))
   {
-    this->m_NiftiImage->ndim = 5;   // This must be 5 for NIFTI_INTENT_VECTOR
+    this->m_NiftiImage->ndim = 5;   // This must be 5 for NIFTI_INTENT_VECTOR and NIFTI_INTENT_DISPVECT
                                     // images.
-    this->m_NiftiImage->dim[0] = 5; // This must be 5 for NIFTI_INTENT_VECTOR
+    this->m_NiftiImage->dim[0] = 5; // This must be 5 for NIFTI_INTENT_VECTOR and NIFTI_INTENT_DISPVECT
                                     // images.
     if (this->GetNumberOfDimensions() > 4)
     {
@@ -1541,7 +1546,11 @@ NiftiImageIO ::WriteImageInformation()
     }
     else
     {
+      // TODO: There is no way to tell if it is a displacement vector (NIFTI_INTENT_DISPVECT)
+      // or some other vector (NIFTI_INTENT_VECTOR), therefore we always use generic vector intent.
       this->m_NiftiImage->intent_code = NIFTI_INTENT_VECTOR;
+      // TODO: consider reorienting vector field values (NIFTI_INTENT_DISPVECT or NIFTI_INTENT_VECTOR)
+      // from ITK's LPS coordinate system to NIFTI's native RAS coordinate system.
     }
     this->m_NiftiImage->nu = this->m_NiftiImage->dim[5] = this->GetNumberOfComponents();
     if (this->GetNumberOfDimensions() < 4)

@@ -188,6 +188,23 @@ public:
   itkSetMacro(LegacyAnalyze75Mode, NiftiImageIOEnums::Analyze75Flavor);
   itkGetConstMacro(LegacyAnalyze75Mode, NiftiImageIOEnums::Analyze75Flavor);
 
+  /** If intent of the dataset is "vector" (NIFTI_INTENT_VECTOR) then vectors values are converted
+   * during reading from RAS to LPS, during writing LPS to RAS.
+   * Disabled by default because vectors may store non-spatial information.
+   */
+  itkSetMacro(ConvertRASVectors, bool);
+  itkGetConstMacro(ConvertRASVectors, bool);
+  itkBooleanMacro(ConvertRASVectors); 
+
+  /** If intent of the dataset is "displacement vector" (NIFTI_INTENT_DISPVECT) then vectors values are converted
+   * during reading from RAS to LPS, during writing LPS to RAS.
+   * Enabled by default because NIFTI files use RAS coordinate system and ITK uses LPS coordinates sytem.
+   * The flag exists to allow software that use RAS coordinate system to bypass unnecessary conversions.
+   */
+  itkSetMacro(ConvertRASDisplacementVectors, bool);
+  itkGetConstMacro(ConvertRASDisplacementVectors, bool);
+  itkBooleanMacro(ConvertRASDisplacementVectors); 
+
 protected:
   NiftiImageIO();
   ~NiftiImageIO() override;
@@ -237,6 +254,10 @@ private:
 
   double m_RescaleSlope{ 1.0 };
   double m_RescaleIntercept{ 0.0 };
+
+  bool m_ConvertRAS{ false };
+  bool m_ConvertRASVectors{ false };
+  bool m_ConvertRASDisplacementVectors{ true };
 
   IOComponentEnum m_OnDiskComponentType{ IOComponentEnum::UNKNOWNCOMPONENTTYPE };
 

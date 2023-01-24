@@ -524,16 +524,33 @@ CastCopy(float * to, const void * from, size_t pixelcount)
 }
 
 // Internal function to convert vectors between RAS and LPS coordinate systems.
+// Dimensions are CXYZT (ITK memory layout)
 template <typename TBuffer>
 void
-ConvertRASToFromLPS(TBuffer * buffer, size_t size)
+ConvertRASToFromLPS_CXYZT(TBuffer * buffer, size_t size)
 {
   int numberOfVectors = size / 3;
   for (size_t i = 0; i < numberOfVectors; ++i)
   {
+    buffer[0] = -buffer[0];
     buffer[1] = -buffer[1];
-    buffer[2] = -buffer[2];
     buffer += 3;
+  }
+}
+
+// Internal function to convert vectors between RAS and LPS coordinate systems.
+// Dimensions are XYZTC (NIFTI memory layout)
+// ttt
+template <typename TBuffer>
+void
+ConvertRASToFromLPS_XYZTC(TBuffer * buffer, size_t size)
+{
+  // Flip the sign of the first two components (L<->R, P<->A)
+  // and keep the third component (S) unchanged.
+  int numberOfVectors = size / 3 * 2;
+  for (size_t i = 0; i < numberOfVectors; ++i)
+  {
+    buffer[i] = -buffer[i];
   }
 }
 
@@ -809,7 +826,7 @@ NiftiImageIO::Read(void * buffer)
     }
   }
 
-  if (m_ConvertRAS)
+  if (this->m_ConvertRAS)
   {
     if (this->GetPixelType() != IOPixelEnum::VECTOR && this->GetPixelType() != IOPixelEnum::POINT)
     {
@@ -819,10 +836,10 @@ NiftiImageIO::Read(void * buffer)
     switch (this->m_ComponentType)
     {
       case IOComponentEnum::FLOAT:
-        ConvertRASToFromLPS(static_cast<float *>(buffer), numElts);
+        ConvertRASToFromLPS_CXYZT(static_cast<float *>(buffer), numElts * numComponents);
         break;
       case IOComponentEnum::DOUBLE:
-        ConvertRASToFromLPS(static_cast<double *>(buffer), numElts);
+        ConvertRASToFromLPS_CXYZT(static_cast<double *>(buffer), numElts * numComponents);
         break;
       default:
           itkExceptionMacro(<< "RAS conversion of datatype " << this->GetComponentTypeAsString(this->m_ComponentType)
@@ -1233,12 +1250,11 @@ NiftiImageIO ::ReadImageInformation()
       break;
     case NIFTI_INTENT_DISPVECT:
       this->SetPixelType(IOPixelEnum::VECTOR);
-      m_ConvertRAS = m_ConvertRASDisplacementVectors;
-      ttt
+      this->m_ConvertRAS = m_ConvertRASDisplacementVectors;
       break;
     case NIFTI_INTENT_VECTOR:
       this->SetPixelType(IOPixelEnum::VECTOR);
-      m_ConvertRAS = m_ConvertRASVectors;
+      this->m_ConvertRAS = m_ConvertRASVectors;
       break;
     case NIFTI_INTENT_NONE:
     case NIFTI_INTENT_CORREL:
@@ -1403,9 +1419,6 @@ NiftiImageIO ::ReadImageInformation()
   // set the image orientation
   this->SetImageIOOrientationFromNIfTI(dims);
 
-  // TODO: consider reorienting vector field values (NIFTI_INTENT_DISPVECT or NIFTI_INTENT_VECTOR)
-  // from NIFTI's native RAS to ITK's LPS coordinate system.
-
   // Set the metadata.
   this->SetImageIOMetadataFromNIfTI();
 
@@ -1567,6 +1580,8 @@ NiftiImageIO ::WriteImageInformation()
   }
   const unsigned int numComponents = this->GetNumberOfComponents();
 
+  MetaDataDictionary & thisDic = this->GetMetaDataDictionary();
+
   // TODO:  Also need to check for RGB images where numComponets=3
   if (numComponents > 1 && !(this->GetPixelType() == IOPixelEnum::COMPLEX && numComponents == 2) &&
       !(this->GetPixelType() == IOPixelEnum::RGB && numComponents == 3) &&
@@ -1581,6 +1596,7 @@ NiftiImageIO ::WriteImageInformation()
       itkExceptionMacro(<< "Can not store a vector image of more than 4 dimensions in a Nifti file. Dimension="
                         << this->GetNumberOfDimensions());
     }
+
     //
     // support symmetric matrix type
     if (this->GetPixelType() == IOPixelEnum::DIFFUSIONTENSOR3D ||
@@ -1590,11 +1606,21 @@ NiftiImageIO ::WriteImageInformation()
     }
     else
     {
-      // TODO: There is no way to tell if it is a displacement vector (NIFTI_INTENT_DISPVECT)
-      // or some other vector (NIFTI_INTENT_VECTOR), therefore we always use generic vector intent.
-      this->m_NiftiImage->intent_code = NIFTI_INTENT_VECTOR;
-      // TODO: consider reorienting vector field values (NIFTI_INTENT_DISPVECT or NIFTI_INTENT_VECTOR)
-      // from ITK's LPS coordinate system to NIFTI's native RAS coordinate system.
+      // Each voxel is a vector. Set intent code to NIFTI_INTENT_VECTOR (default)
+      // or NIFTI_INTENT_DISPVECT.
+      int intentCode = NIFTI_INTENT_VECTOR;
+      std::string intentCodeStrInMetaData;
+      if (itk::ExposeMetaData<std::string>(thisDic, "intent_code", intentCodeStrInMetaData))
+      {
+        std::istringstream is(intentCodeStrInMetaData);
+        int intentCodeInMetaData = -1;
+        is >> intentCodeInMetaData;
+        if (intentCodeInMetaData == NIFTI_INTENT_DISPVECT)
+        {
+          intentCode = NIFTI_INTENT_DISPVECT;
+        }
+      }
+      this->m_NiftiImage->intent_code = intentCode;
     }
     this->m_NiftiImage->nu = this->m_NiftiImage->dim[5] = this->GetNumberOfComponents();
     if (this->GetNumberOfDimensions() < 4)
@@ -1759,7 +1785,6 @@ NiftiImageIO ::WriteImageInformation()
   // TODO: Note both arguments are the same, no need to distinguish between them.
   this->SetNIfTIOrientationFromImageIO(this->GetNumberOfDimensions(), this->GetNumberOfDimensions());
 
-  MetaDataDictionary & thisDic = this->GetMetaDataDictionary();
   std::string          temp;
   if (itk::ExposeMetaData<std::string>(thisDic, "aux_file", temp))
   {
@@ -1773,10 +1798,6 @@ NiftiImageIO ::WriteImageInformation()
     }
   }
 
-  // Set intent code based on metadata dictionary
-  int intentCode = NIFTI_INTENT_NONE;
-  itk::ExposeMetaData<int>(thisDic, "intent_code", intentCode);
-  this->m_NiftiImage->intent_code = intentCode;
   // Enable RAS conversion based on metadata and flags
   this->m_ConvertRAS = (m_ConvertRASVectors && this->m_NiftiImage->intent_code == NIFTI_INTENT_VECTOR) ||
                        (m_ConvertRASDisplacementVectors && this->m_NiftiImage->intent_code == NIFTI_INTENT_DISPVECT);
@@ -2343,64 +2364,54 @@ NiftiImageIO ::Write(const void * buffer)
         vecOrder[i] = i;
       }
     }
+
+    for (int t = 0; t < this->m_NiftiImage->dim[4]; ++t)
+    {
+      for (int z = 0; z < this->m_NiftiImage->dim[3]; ++z)
+      {
+        for (int y = 0; y < this->m_NiftiImage->dim[2]; ++y)
+        {
+          for (int x = 0; x < this->m_NiftiImage->dim[1]; ++x)
+          {
+            for (unsigned int c = 0; c < numComponents; ++c)
+            {
+              const size_t nifti_index =
+                (c * seriesdist + volumedist * t + slicedist * z + rowdist * y + x) * this->m_NiftiImage->nbyper;
+              const size_t itk_index =
+                ((volumedist * t + slicedist * z + rowdist * y + x) * numComponents + vecOrder[c]) *
+                this->m_NiftiImage->nbyper;
+
+              for (int b = 0; b < this->m_NiftiImage->nbyper; ++b)
+              {
+                nifti_buf[nifti_index + b] = itkbuf[itk_index + b];
+              }
+            }
+          }
+        }
+      }
+    }
+
     if (this->m_ConvertRAS)
     {
-      for (int t = 0; t < this->m_NiftiImage->dim[4]; ++t)
+      if (this->GetPixelType() != IOPixelEnum::VECTOR && this->GetPixelType() != IOPixelEnum::POINT)
       {
-        for (int z = 0; z < this->m_NiftiImage->dim[3]; ++z)
-        {
-          for (int y = 0; y < this->m_NiftiImage->dim[2]; ++y)
-          {
-            for (int x = 0; x < this->m_NiftiImage->dim[1]; ++x)
-            {
-              for (unsigned int c = 0; c < numComponents; ++c)
-              {
-                const size_t nifti_index =
-                  (c * seriesdist + volumedist * t + slicedist * z + rowdist * y + x) * this->m_NiftiImage->nbyper;
-                const size_t itk_index =
-                  ((volumedist * t + slicedist * z + rowdist * y + x) * numComponents + vecOrder[c]) *
-                  this->m_NiftiImage->nbyper;
-
-              //TODO: copy with optional inversion - probably it has to be a templated class so that inversion can happen
-
-                for (int b = 0; b < this->m_NiftiImage->nbyper; ++b)
-                {
-                  nifti_buf[nifti_index + b] = itkbuf[itk_index + b];
-                }
-              }
-            }
-          }
-        }
+        itkExceptionMacro(<< "RAS conversion requires pixel to be 3-component vector or point. Current pixel type is "
+                          << numComponents << "-component " << this->GetPixelType() << ".");
+      }
+      switch (this->m_ComponentType)
+      {
+        case IOComponentEnum::FLOAT:
+          ConvertRASToFromLPS_XYZTC(reinterpret_cast<float *>(nifti_buf.get()), numComponents * seriesdist);
+          break;
+        case IOComponentEnum::DOUBLE:
+          ConvertRASToFromLPS_XYZTC(reinterpret_cast<double *>(nifti_buf.get()), numComponents * seriesdist);
+          break;
+        default:
+          itkExceptionMacro(<< "RAS conversion of datatype " << this->GetComponentTypeAsString(this->m_ComponentType)
+                            << " is not supported");
       }
     }
-    else
-    {
-      for (int t = 0; t < this->m_NiftiImage->dim[4]; ++t)
-      {
-        for (int z = 0; z < this->m_NiftiImage->dim[3]; ++z)
-        {
-          for (int y = 0; y < this->m_NiftiImage->dim[2]; ++y)
-          {
-            for (int x = 0; x < this->m_NiftiImage->dim[1]; ++x)
-            {
-              for (unsigned int c = 0; c < numComponents; ++c)
-              {
-                const size_t nifti_index =
-                  (c * seriesdist + volumedist * t + slicedist * z + rowdist * y + x) * this->m_NiftiImage->nbyper;
-                const size_t itk_index =
-                  ((volumedist * t + slicedist * z + rowdist * y + x) * numComponents + vecOrder[c]) *
-                  this->m_NiftiImage->nbyper;
 
-                for (int b = 0; b < this->m_NiftiImage->nbyper; ++b)
-                {
-                  nifti_buf[nifti_index + b] = itkbuf[itk_index + b];
-                }
-              }
-            }
-          }
-        }
-      }
-    }
     delete[] vecOrder;
     dumpdata(buffer);
     // Need a const cast here so that we don't have to copy the memory for

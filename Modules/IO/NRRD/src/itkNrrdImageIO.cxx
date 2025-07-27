@@ -25,6 +25,88 @@
 
 #include <sstream>
 
+namespace
+{
+// This function determines which NRRD axis should be used for pixel component in the ITK image,
+// and which NRRD axes should be used for the ITK image axes.
+// The pixel component axis is the first NRRD range axis (preferably a non-list axis).
+// The image axes are the NRRD domain axes followed by the range axes (except the one that was already used as
+// component).
+void
+GetAxisOrderForFileReading(Nrrd *                      nrrd,
+                           std::vector<unsigned int> & imageAxes_nrrd,
+                           int &                       componentAxisIndex_nrrd,
+                           unsigned int &              numberOfDomainAxes,
+                           bool &                      needPermutation)
+{
+  imageAxes_nrrd.clear();
+
+  // domainAxis: space dimensions.
+  // rangeAxis: additional axes that are not space dimensions, such as components or time points.
+  // Examples:
+  //   domain domain domain list -> numberOfDomainAxes = 3, rangeAxisNum_nrrd = 1
+  //   list domain domain domain -> numberOfDomainAxes = 3, rangeAxisNum_nrrd = 1
+  //   RGBA-color domain domain domain list -> numberOfDomainAxes = 3, rangeAxisNum_nrrd = 2
+  //   covariant-vector domain domain domain list -> numberOfDomainAxes = 3, rangeAxisNum_nrrd = 2
+
+  unsigned int domainAxisIndices_nrrd[NRRD_DIM_MAX]{};
+  numberOfDomainAxes = nrrdDomainAxesGet(nrrd, domainAxisIndices_nrrd);
+  unsigned int rangeAxisIndices_nrrd[NRRD_DIM_MAX]{};
+  unsigned int rangeAxisNum_nrrd = nrrdRangeAxesGet(nrrd, rangeAxisIndices_nrrd);
+
+  if (rangeAxisNum_nrrd == 0)
+  {
+    // simple scalar image (it only contain domain axes)
+    needPermutation = false;
+    componentAxisIndex_nrrd = -1; // No pixel component axis
+    for (unsigned int axis = 0; axis < nrrd->dim; ++axis)
+    {
+      imageAxes_nrrd.push_back(axis);
+    }
+  }
+  else
+  {
+    // The NRRD file contains both domain and range axes.
+
+    // By default, use the first range axis as pixel component
+    componentAxisIndex_nrrd = rangeAxisIndices_nrrd[0];
+    if (rangeAxisNum_nrrd > 1)
+    {
+      // There are multiple range axes. For pixel component, prefer the first axis that is not "list" kind.
+      // For example, if there are RGBColor and a list axes then prefer using the non-list RGBColor as component axis.
+      // List axes will be additional image dimensions.
+      for (unsigned int axInd = 0; axInd < rangeAxisNum_nrrd; ++axInd)
+      {
+        if (nrrd->axis[rangeAxisIndices_nrrd[axInd]].kind != nrrdKindList)
+        {
+          componentAxisIndex_nrrd = rangeAxisIndices_nrrd[axInd];
+          break;
+        }
+      }
+    }
+
+    needPermutation = (componentAxisIndex_nrrd != 0) || (rangeAxisNum_nrrd > 1);
+
+    // Add all domain axes
+    for (unsigned int domainAxisIndex = 0; domainAxisIndex < numberOfDomainAxes; ++domainAxisIndex)
+    {
+      unsigned int domainAxis_nrrd = domainAxisIndices_nrrd[domainAxisIndex];
+      imageAxes_nrrd.push_back(domainAxis_nrrd);
+    }
+    // Add all range axes that are not already added as component axis
+    for (unsigned int rangeAxisIndex = 1; rangeAxisIndex < rangeAxisNum_nrrd; ++rangeAxisIndex)
+    {
+      unsigned int rangeAxis_nrrd = rangeAxisIndices_nrrd[rangeAxisIndex];
+      if (rangeAxis_nrrd != componentAxisIndex_nrrd)
+      {
+        imageAxes_nrrd.push_back(rangeAxis_nrrd);
+      }
+    }
+  }
+}
+
+} // namespace
+
 namespace itk
 {
 #define KEY_PREFIX "NRRD_"
@@ -339,56 +421,33 @@ NrrdImageIO::ReadImageInformation()
     }
     this->SetComponentType(cmpType);
 
-    // Set the number of image dimensions and bail if needed
-    unsigned int domainAxisNum, domainAxisIdx[NRRD_DIM_MAX], rangeAxisNum, rangeAxisIdx[NRRD_DIM_MAX];
-    domainAxisNum = nrrdDomainAxesGet(nrrd, domainAxisIdx);
-    rangeAxisNum = nrrdRangeAxesGet(nrrd, rangeAxisIdx);
-    if (nrrd->spaceDim && nrrd->spaceDim != domainAxisNum)
+    int                       componentAxisIndex_nrrd{ -1 };
+    std::vector<unsigned int> imageAxes_nrrd;
+    bool                      needPermutation{ false };
+    unsigned int              numberOfDomainAxes{ 0 };
+    GetAxisOrderForFileReading(nrrd, imageAxes_nrrd, componentAxisIndex_nrrd, numberOfDomainAxes, needPermutation);
+
+    if (nrrd->spaceDim != numberOfDomainAxes)
     {
-      itkExceptionMacro("ReadImageInformation: nrrd's #independent axes (" << domainAxisNum
+      itkExceptionMacro("ReadImageInformation: nrrd's #independent axes (" << numberOfDomainAxes
                                                                            << ") doesn't match dimension of space"
                                                                               " in which orientation is defined ("
                                                                            << nrrd->spaceDim
                                                                            << "); not currently handled");
     }
-    // else nrrd->spaceDim == domainAxisNum when nrrd has orientation
 
-    int rangeAxisIndex{-1};
-    if (0 == rangeAxisNum)
+    if (componentAxisIndex_nrrd < 0)
     {
-      // we don't have any non-scalar data
+      // simple scalar image
       this->SetNumberOfDimensions(nrrd->dim);
       this->SetPixelType(IOPixelEnum::SCALAR);
       this->SetNumberOfComponents(1);
     }
     else
     {
-      // In case of multiple range axes, only handle range axes that are not "list" kind.
-      // List axes can be read in the image normally.
-      if (1 == rangeAxisNum)
-      {
-        rangeAxisIndex = rangeAxisIdx[0];
-      }
-      else
-      {
-        for (unsigned int axInd = 0; axInd < rangeAxisNum; ++axInd)
-        {
-          if (nrrd->axis[rangeAxisIdx[axInd]].kind != nrrdKindList)
-          {
-            rangeAxisIndex = rangeAxisIdx[axInd];
-            break; // Only one range axis allowed
-          }
-        }
-      }
-      if (rangeAxisIndex < 0)
-      {
-        itkExceptionMacro("ReadImageInformation: nrrd has " << rangeAxisNum
-                                                            << " dependent axis (not 1); not currently handled");
-      }
-
-      this->SetNumberOfDimensions(nrrd->dim - 1);
-      int    kind = nrrd->axis[rangeAxisIndex].kind;
-      size_t size = nrrd->axis[rangeAxisIndex].size;
+      this->SetNumberOfDimensions(imageAxes_nrrd.size());
+      int    kind = nrrd->axis[componentAxisIndex_nrrd].kind;
+      size_t size = nrrd->axis[componentAxisIndex_nrrd].size;
       // NOTE: it is the NRRD readers responsibility to make sure that
       // the size (#of components) associated with a specific kind is
       // matches the actual size of the axis.
@@ -469,8 +528,7 @@ NrrdImageIO::ReadImageInformation()
 
     double              spacing;
     double              spaceDir[NRRD_SPACE_DIM_MAX];
-    unsigned int itkDomainAxisNum = domainAxisNum + (rangeAxisNum > 0 ? rangeAxisNum - 1 : 0);
-    std::vector<double> spaceDirStd(itkDomainAxisNum);
+    unsigned int        imageDimensions = imageAxes_nrrd.size();
     int                 spacingStatus;
 
     int iFlipFactors[3]; // used to flip the measurement frame later on
@@ -479,20 +537,20 @@ NrrdImageIO::ReadImageInformation()
       iFlipFactor = 1;
     }
 
-    for (unsigned int axii = 0; axii < domainAxisNum; ++axii)
+    for (unsigned int domainAxis_itk = 0; domainAxis_itk < numberOfDomainAxes; ++domainAxis_itk)
     {
-      unsigned int naxi = domainAxisIdx[axii];
-      this->SetDimensions(axii, static_cast<unsigned int>(nrrd->axis[naxi].size));
-      spacingStatus = nrrdSpacingCalculate(nrrd, naxi, &spacing, spaceDir);
+      unsigned int domainAxis_nrrd = imageAxes_nrrd[domainAxis_itk];
+      this->SetDimensions(domainAxis_itk, static_cast<unsigned int>(nrrd->axis[domainAxis_nrrd].size));
+      spacingStatus = nrrdSpacingCalculate(nrrd, domainAxis_nrrd, &spacing, spaceDir);
 
       switch (spacingStatus)
       {
         case nrrdSpacingStatusNone:
           // Let ITK's defaults stay
-          // this->SetSpacing(axii, 1.0);
+          // this->SetSpacing(domainAxis_itk, 1.0);
           break;
         case nrrdSpacingStatusScalarNoSpace:
-          this->SetSpacing(axii, spacing);
+          this->SetSpacing(domainAxis_itk, spacing);
           break;
         case nrrdSpacingStatusDirection:
           if (AIR_EXISTS(spacing))
@@ -519,13 +577,14 @@ NrrdImageIO::ReadImageInformation()
                 // to LPS is well-defined
                 break;
             }
-            this->SetSpacing(axii, spacing);
+            this->SetSpacing(domainAxis_itk, spacing);
 
-            for (unsigned int saxi = 0; saxi < itkDomainAxisNum; ++saxi)
+            std::vector<double> spaceDirStd(imageDimensions);
+            for (unsigned int axis = 0; axis < domainAxis_nrrd; ++axis)
             {
-              spaceDirStd[saxi] = (saxi < nrrd->spaceDim ? spaceDir[saxi] : 0);
+              spaceDirStd[axis] = spaceDir[axis];
             }
-            this->SetDirection(axii, spaceDirStd);
+            this->SetDirection(domainAxis_itk, spaceDirStd);
           }
           break;
         default:
@@ -537,37 +596,36 @@ NrrdImageIO::ReadImageInformation()
                             "nrrd spacing (nrrdSpacingStatusScalarWithSpace)");
       }
     }
-    // If there are more non-domain axes, then handle only the first one as range axis,
-    // because ITK needs to store the rest of the dimensions as domain-like.
-    if (rangeAxisNum > 1)
-    {
-      for (unsigned int axii = 1; axii < rangeAxisNum; ++axii)
-      {
-        unsigned int naxi = rangeAxisIdx[axii];
-        unsigned int iaxi = domainAxisNum + axii - 1;
-        this->SetDimensions(iaxi, static_cast<unsigned int>(nrrd->axis[naxi].size));
 
-        // Cannot calculate spacing for this axis using nrrdSpacingCalculate,
-        // because in NRRD it is not domain kind. Set default values for axis.
-        this->SetSpacing(iaxi, 1.0);
-        for (unsigned int saxi = 0; saxi < nrrd->spaceDim + rangeAxisNum - 1; ++saxi)
-        {
-          spaceDirStd[saxi] = (saxi == iaxi ? 1.0 : 0.0);
-        }
-        this->SetDirection(iaxi, spaceDirStd);
+    // If there are additional range axis in the NRRD file then add those as extra domain axes to the ITK image.
+    for (unsigned int axis_itk = numberOfDomainAxes; axis_itk < imageAxes_nrrd.size(); ++axis_itk)
+    {
+      unsigned int axis_nrrd = imageAxes_nrrd[axis_itk];
+      // NRRD file range axis is added to the ITK image as domain axis
+      this->SetDimensions(axis_itk, static_cast<unsigned int>(nrrd->axis[axis_nrrd].size));
+
+      // Cannot calculate spacing for this axis using nrrdSpacingCalculate,
+      // because in NRRD it is a range axis, not domain kind. Set default values for axis.
+      this->SetSpacing(axis_itk, 1.0);
+
+      std::vector<double> spaceDirStd(imageDimensions);
+      for (unsigned int axis = 0; axis < imageDimensions; ++axis)
+      {
+        spaceDirStd[axis] = (axis == axis_itk ? 1.0 : 0.0);
       }
+      this->SetDirection(axis_itk, spaceDirStd);
     }
 
-    // Figure out origin
+    // Set origin for NRRD domain axes
     if (nrrd->spaceDim)
     {
       if (AIR_EXISTS(nrrd->spaceOrigin[0]))
       {
         // only set info if we have something to set
         double spaceOrigin[NRRD_SPACE_DIM_MAX];
-        for (unsigned int saxi = 0; saxi < nrrd->spaceDim; ++saxi)
+        for (unsigned int axis = 0; axis < nrrd->spaceDim; ++axis)
         {
-          spaceOrigin[saxi] = nrrd->spaceOrigin[saxi];
+          spaceOrigin[axis] = nrrd->spaceOrigin[axis];
         }
         switch (nrrd->space)
         {
@@ -587,17 +645,19 @@ NrrdImageIO::ReadImageInformation()
             // to LPS is well-defined
             break;
         }
-        for (unsigned int saxi = 0; saxi < nrrd->spaceDim; ++saxi)
+        for (unsigned int axis = 0; axis < nrrd->spaceDim; ++axis)
         {
-          this->SetOrigin(saxi, spaceOrigin[saxi]);
+          this->SetOrigin(axis, spaceOrigin[axis]);
         }
       }
     }
     else
     {
       double spaceOrigin[NRRD_DIM_MAX];
-      int    originStatus = nrrdOriginCalculate(nrrd, domainAxisIdx, domainAxisNum, nrrdCenterCell, spaceOrigin);
-      for (unsigned int saxi = 0; saxi < domainAxisNum; ++saxi)
+      unsigned int domainAxisIndices_nrrd[NRRD_DIM_MAX]{};
+      unsigned int numberOfDomainAxes = nrrdDomainAxesGet(nrrd, domainAxisIndices_nrrd);
+      int    originStatus = nrrdOriginCalculate(nrrd, domainAxisIndices_nrrd, numberOfDomainAxes, nrrdCenterCell, spaceOrigin);
+      for (unsigned int saxi = 0; saxi < numberOfDomainAxes; ++saxi)
       {
         switch (originStatus)
         {
@@ -638,100 +698,63 @@ NrrdImageIO::ReadImageInformation()
 
     // save in MetaDataDictionary those important nrrd fields that
     // (currently) have no ITK equivalent. NOTE that for the per-axis
-    // information, we use the same axis index (axii) as in ITK, NOT
-    // the original axis index in nrrd (axi).  This is because in the
+    // information, we use the same axis index (domainAxisIndex) as in ITK, NOT
+    // the original axis index in nrrd (axis_nrrd).  This is because in the
     // Read() method, non-scalar data is permuted to the fastest axis,
     // on the on the Write() side, its always written to the fastest axis,
     // so we might as well go with consistent and idiomatic indexing.
-    NrrdAxisInfo * naxis;
-    for (unsigned int axii = 0; axii < domainAxisNum; ++axii)
+    //for (unsigned int domainAxisIndex = 0; domainAxisIndex < numberOfDomainAxes; ++domainAxisIndex)
+    for (unsigned int axis_itk = 0; axis_itk < imageDimensions; ++axis_itk)
     {
-      unsigned int axi = domainAxisIdx[axii];
-      naxis = nrrd->axis + axi;
-      if (AIR_EXISTS(naxis->thickness))
+      unsigned int axis_nrrd = imageAxes_nrrd[axis_itk];
+      NrrdAxisInfo * axisInfo = nrrd->axis + axis_nrrd;
+      if (AIR_EXISTS(axisInfo->thickness))
       {
-        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_thicknesses), axii);
-        EncapsulateMetaData<double>(thisDic, std::string(key), naxis->thickness);
+        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_thicknesses), axis_itk);
+        EncapsulateMetaData<double>(thisDic, std::string(key), axisInfo->thickness);
       }
-      if (naxis->center)
+      if (axisInfo->center)
       {
-        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_centers), axii);
-        val = airEnumStr(nrrdCenter, naxis->center);
+        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_centers), axis_itk);
+        val = airEnumStr(nrrdCenter, axisInfo->center);
         EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(val));
       }
-      if (naxis->kind)
+      if (axisInfo->kind)
       {
-        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_kinds), axii);
-        val = airEnumStr(nrrdKind, naxis->kind);
+        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_kinds), axis_itk);
+        val = airEnumStr(nrrdKind, axisInfo->kind);
         EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(val));
       }
-      if (airStrlen(naxis->label))
+      if (airStrlen(axisInfo->label))
       {
-        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_labels), axii);
-        EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(naxis->label));
+        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_labels), axis_itk);
+        EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(axisInfo->label));
       }
-      if (airStrlen(naxis->units))
+      if (airStrlen(axisInfo->units))
       {
-        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_units), axii);
-        EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(naxis->units));
-      }
-    }
-    if (rangeAxisNum == 1 && rangeAxisIndex > 0)
-    {
-      // Store label and unit of range axis if the axes are permuted
-      naxis = nrrd->axis + rangeAxisIndex;
-      if (airStrlen(naxis->label))
-      {
-        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_labels), rangeAxisIndex);
-        EncapsulateMetaData<std::string>(thisDic, "RangeAxisLabel", std::string(naxis->label));
-      }
-      if (airStrlen(naxis->units))
-      {
-        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_units), rangeAxisIndex);
-        EncapsulateMetaData<std::string>(thisDic, "RangeAxisUnit", std::string(naxis->units));
+        snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_units), axis_itk);
+        EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(axisInfo->units));
       }
     }
-    else if (rangeAxisNum > 1)
+    if (componentAxisIndex_nrrd >= 0)
     {
-      // Store per-axis metadata for range axes if there are multiple (and thus no permutation)
-      for (unsigned int axii = 0; axii < rangeAxisNum; ++axii)
+      // The pixel component has no assigned axis number in the ITK image, therefore
+      // save the label and unit in a special useStore label and unit of range axis if the axes are permuted
+      NrrdAxisInfo * axisInfo = nrrd->axis + componentAxisIndex_nrrd;
+      if (airStrlen(axisInfo->label))
       {
-        unsigned int axi = rangeAxisIdx[axii];
-        naxis = nrrd->axis + axi;
-        std::string metadataKey;
-        if (naxis->kind && axi > 0) // Skip kind for range axis that is interpreted as voxel components
-        {
-          snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_kinds), axi-1);
-          val = airEnumStr(nrrdKind, naxis->kind);
-          EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(val));
-        }
-        if (airStrlen(naxis->label))
-        {
-          if (axi == 0)
-          {
-            metadataKey = "RangeAxisLabel"; // The first range axis is stored as component
-          }
-          else
-          {
-            snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_labels), axi-1);
-            metadataKey = std::string(key);
-          }
-          EncapsulateMetaData<std::string>(thisDic, metadataKey, std::string(naxis->label));
-        }
-        if (airStrlen(naxis->units))
-        {
-          if (axi == 0)
-          {
-            metadataKey = "RangeAxisUnit"; // The first range axis is stored as component
-          }
-          else
-          {
-            snprintf(key, sizeof(key), "%s%s[%u]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_units), axi-1);
-            metadataKey = std::string(key);
-          }
-          EncapsulateMetaData<std::string>(thisDic, metadataKey, std::string(naxis->units));
-        }
+        snprintf(key, sizeof(key), "%s%s[component]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_labels));
+        EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(axisInfo->label));
       }
+      if (airStrlen(axisInfo->units))
+      {
+        snprintf(key, sizeof(key), "%s%s[component]", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_units));
+        EncapsulateMetaData<std::string>(thisDic, std::string(key), std::string(axisInfo->units));
+      }
+      // Save the original component index, just incase there are some custom metadata fields that
+      // can only be interpreted if this information is known
+      snprintf(key, sizeof(key), "%soriginal_component_axis", KEY_PREFIX);
+      EncapsulateMetaData<std::string>(thisDic, std::string(key), std::to_string(componentAxisIndex_nrrd));
     }
 
     // Parse generic (not per-axis) metadata
@@ -779,18 +802,18 @@ NrrdImageIO::ReadImageInformation()
     if (AIR_EXISTS(nrrd->measurementFrame[0][0]))
     {
       snprintf(key, sizeof(key), "%s%s", KEY_PREFIX, airEnumStr(nrrdField, nrrdField_measurement_frame));
-      std::vector<std::vector<double>> msrFrame(domainAxisNum);
+      std::vector<std::vector<double>> msrFrame(numberOfDomainAxes);
 
       // flip the measurement frame here if we have to
       // so that everything is consistent with the ITK LPS space directions
       // but only do this if we have a three dimensional space or smaller
 
-      for (unsigned int saxi = 0; saxi < domainAxisNum; ++saxi)
+      for (unsigned int saxi = 0; saxi < numberOfDomainAxes; ++saxi)
       {
-        msrFrame[saxi].resize(domainAxisNum);
-        for (unsigned int saxj = 0; saxj < domainAxisNum; ++saxj)
+        msrFrame[saxi].resize(numberOfDomainAxes);
+        for (unsigned int saxj = 0; saxj < numberOfDomainAxes; ++saxj)
         {
-          if (domainAxisNum <= 3)
+          if (numberOfDomainAxes <= 3)
           {
             msrFrame[saxi][saxj] = iFlipFactors[saxj] * nrrd->measurementFrame[saxi][saxj];
           }
@@ -826,7 +849,7 @@ NrrdImageIO::Read(void * buffer)
   // NOTE the main reason the logic becomes complicated here is that
   // ITK has to be the one to allocate the data segment ("buffer")
 
-  if (IOPixelEnum::SYMMETRICSECONDRANKTENSOR == this->GetPixelType())
+  if (this->GetPixelType()  == IOPixelEnum::SYMMETRICSECONDRANKTENSOR)
   {
     // It may be that this is coming from a nrrdKind3DMaskedSymMatrix,
     // in which case ITK's buffer has not been allocated for the
@@ -840,23 +863,26 @@ NrrdImageIO::Read(void * buffer)
     // the nrrd knows the allocated data size (the axes may actually be out
     // of order in the case of non-scalar data.  Internal to nrrdLoad(), the
     // given buffer will be re-used, instead of allocating new data.
-    unsigned int baseDim;
     nrrdAllocated = false;
     nrrd->data = buffer;
     nrrd->type = this->ITKToNrrdComponentType(this->m_ComponentType);
     if (IOPixelEnum::SCALAR == this->m_PixelType)
     {
-      baseDim = 0;
+      nrrd->dim = this->GetNumberOfDimensions();
+      for (unsigned int axis = 0; axis < this->GetNumberOfDimensions(); ++axis)
+      {
+        nrrd->axis[axis].size = this->GetDimensions(axis);
+      }
     }
     else
     {
-      baseDim = 1;
       nrrd->axis[0].size = this->GetNumberOfComponents();
-    }
-    nrrd->dim = baseDim + this->GetNumberOfDimensions();
-    for (unsigned int axi = 0; axi < this->GetNumberOfDimensions(); ++axi)
-    {
-      nrrd->axis[axi + baseDim].size = this->GetDimensions(axi);
+      nrrd->dim = this->GetNumberOfDimensions() + 1;
+      for (unsigned int axis = 0; axis < this->GetNumberOfDimensions(); ++axis)
+      {
+        nrrd->axis[axis + 1].size = this->GetDimensions(axis);
+      }
+
     }
   }
 
@@ -880,44 +906,26 @@ NrrdImageIO::Read(void * buffer)
   FloatingPointExceptions::SetEnabled(saveFPEState);
 #endif
 
-  unsigned int rangeAxisNum, rangeAxisIdx[NRRD_DIM_MAX];
-  rangeAxisNum = nrrdRangeAxesGet(nrrd, rangeAxisIdx);
+  int componentAxisIndex_nrrd{-1};
+  std::vector<unsigned int> imageAxes_nrrd;
+  unsigned int              numberOfDomainAxes{ 0 };
+  bool                      needPermutation{ false };
+  GetAxisOrderForFileReading(nrrd, imageAxes_nrrd, componentAxisIndex_nrrd, numberOfDomainAxes, needPermutation);
 
-  // In case of multiple range axes, only handle range axes that are not "list" kind.
-  // List axes can be read in the image normally.
-  int rangeAxisIndex{-1};
-  if (1 == rangeAxisNum)
+  if (needPermutation)
   {
-    rangeAxisIndex = rangeAxisIdx[0];
-  }
-  else
-  {
-    for (unsigned int axInd = 0; axInd < rangeAxisNum; ++axInd)
-    {
-      if (nrrd->axis[rangeAxisIdx[axInd]].kind != nrrdKindList)
-      {
-        rangeAxisIndex = rangeAxisIdx[axInd];
-        break; // Only one range axis allowed
-      }
-    }
-  }
-
-  if (rangeAxisNum > 0 && rangeAxisIndex < 0)
-  {
-    itkExceptionMacro("Read: handling more than one non-scalar axis "
-      "with kind other than list is not currently supported.");
-  }
-  if (rangeAxisNum == 1 && rangeAxisIndex != 0)
-  {
-    // the range (dependent variable) is not on the fastest axis,
+    // the pixel component is not on the fastest axis,
     // so we have to permute axes to put it there, since that is
     // how we set things up in ReadImageInformation() above
     Nrrd *       ntmp = nrrdNew();
     unsigned int axmap[NRRD_DIM_MAX];
-    axmap[0] = rangeAxisIndex;
-    for (unsigned int axi = 1; axi < nrrd->dim; ++axi)
+    if (componentAxisIndex_nrrd >= 0)
     {
-      axmap[axi] = axi - (axi <= (unsigned int)rangeAxisIndex);
+      imageAxes_nrrd.insert(imageAxes_nrrd.begin(), componentAxisIndex_nrrd);
+    }
+    for (unsigned int axis = 0; axis < imageAxes_nrrd.size(); ++axis)
+    {
+      axmap[axis] = imageAxes_nrrd[axis];
     }
     // The memory size of the input and output of nrrdAxesPermute is
     // the same; the existing nrrd->data is re-used.
@@ -939,11 +947,11 @@ NrrdImageIO::Read(void * buffer)
     {
       // we crop out the mask and put the output in ITK-allocated "buffer"
       size_t size[NRRD_DIM_MAX], minIdx[NRRD_DIM_MAX], maxIdx[NRRD_DIM_MAX];
-      for (unsigned int axi = 0; axi < nrrd->dim; ++axi)
+      for (unsigned int axis = 0; axis < nrrd->dim; ++axis)
       {
-        minIdx[axi] = (0 == axi) ? 1 : 0;
-        maxIdx[axi] = nrrd->axis[axi].size - 1;
-        size[axi] = maxIdx[axi] - minIdx[axi] + 1;
+        minIdx[axis] = (0 == axis) ? 1 : 0;
+        maxIdx[axis] = nrrd->axis[axis].size - 1;
+        size[axis] = maxIdx[axis] - minIdx[axis] + 1;
       }
       Nrrd * ntmp = nrrdNew();
       if (nrrdCopy(ntmp, nrrd))
@@ -967,7 +975,7 @@ NrrdImageIO::Read(void * buffer)
       nrrdNuke(nrrd);
     }
   }
-  else //
+  else
   {
     // "buffer" == nrrd->data was ITK-allocated; lose the nrrd struct
     nrrdNix(nrrd);
